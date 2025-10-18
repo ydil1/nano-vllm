@@ -16,17 +16,6 @@ DEFAULT_AUDIO_PATCHES = 0
 
 @dataclass(frozen=True)
 class PlaceholderRange:
-    """
-    占位符范围定义（基于 vLLM 的设计）
-
-    Example:
-        文本: "看这张 <image> 图片"
-        token_ids: [101, 102, IMAGE_TOKEN_ID, 103]
-
-        占位符将记录:
-        - offset: 2 (IMAGE_TOKEN_ID 的位置)
-        - length: 576 (展开后占576个位置)
-    """
     offset: int      
     length: int    
     modality: str 
