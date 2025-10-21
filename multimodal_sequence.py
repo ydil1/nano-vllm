@@ -9,7 +9,6 @@ import torch
 IMAGE_TOKEN_ID = -200 
 VIDEO_TOKEN_ID = -201 
 AUDIO_TOKEN_ID = -202 
-DEFAULT_IMAGE_PATCHES = 576
 #TODO:我还需要找到这里patch的计算方法，比如视频和音频的patch数量
 IMAGE_TOKEN_ID = -200
 DEFAULT_IMAGE_PATCHES = 576 
