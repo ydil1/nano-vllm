@@ -1,18 +1,22 @@
 import pickle
 import torch
 import torch.distributed as dist
+import os
+import json
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 from typing import List, Optional, Dict, Any, Tuple
-
 from nanovllm.config import Config
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
-
+from PIL import Image
+from nanovllm.models.llava import LlavaForConditionalGeneration
+from nanovllm.models.clip_image_processing import CLIPImageProcessor
+from transformers import AutoTokenizer, AutoConfig
+from transformers import CLIPImageProcessor as HFCLIPImageProcessor
 from multimodal_sequence import MultimodalSequence, IMAGE_TOKEN_ID, DEFAULT_IMAGE_PATCHES
 from multimodal_block_manager import MultimodalBlockManager
-
 
 class MultimodalModelRunner:
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
@@ -29,8 +33,9 @@ class MultimodalModelRunner:
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
 
-        # TODO: 这里需要加载支持多模态的模型
+        self.model = self._load_multimodal_model(config)
         self.image_processor = self._init_image_processor(config)
+        self.tokenizer = self._init_tokenizer(config)
 
         self.sampler = Sampler()
         self.warmup_model()
@@ -41,8 +46,6 @@ class MultimodalModelRunner:
 
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
-
-        # 多进程通信（与原始相同）
         if self.world_size > 1:
             if rank == 0:
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
@@ -52,16 +55,47 @@ class MultimodalModelRunner:
                 self.shm = SharedMemory(name="nanovllm")
                 self.loop()
 
+    def _load_multimodal_model(self, config):
+        model_path = config.model or "liuhaotian/llava-v1.5-7b" #hardcode 一下,之前报了个错
+
+        if hasattr(config, 'model_type') and config.model_type == 'llava':
+            from nanovllm.models.llava import LlavaForConditionalGeneration
+            from transformers import LlavaConfig
+
+            llava_config = LlavaConfig.from_pretrained(model_path)
+            model = LlavaForConditionalGeneration(llava_config)
+
+            if os.path.exists(model_path):
+                state_dict = torch.load(os.path.join(model_path, "pytorch_model.bin"), map_location="cpu")
+                model.load_state_dict(state_dict, strict=False)
+        else:
+            model = load_model(config)
+
+        return model
+
+    def _init_tokenizer(self, config):
+        model_path = config.model or "liuhaotian/llava-v1.5-7b"
+        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+        tokenizer.add_special_tokens({'additional_special_tokens': ['<image>']})
+        return tokenizer
+
     def _init_image_processor(self, config):
-        """
-        初始化图像处理器
-        根据模型类型选择合适的处理器（CLIP, ViT等）
-        """
-        # TODO: 根据配置初始化图像处理器
-        # 例如：
-        # from transformers import CLIPImageProcessor
-        # return CLIPImageProcessor.from_pretrained(config.vision_model)
-        pass
+        model_path = config.model or "liuhaotian/llava-v1.5-7b"
+        if hasattr(config, 'model_type') and config.model_type == 'llava':
+            from nanovllm.models.clip_image_processing import CLIPImageProcessor
+            return CLIPImageProcessor(
+                size=336,
+                crop_size=336,
+                do_normalize=True,
+                do_resize=True,
+                do_center_crop=False,
+                do_convert_rgb=True,
+            )
+        else:
+            try:
+                return HFCLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14-336")
+            except:
+                return None
 
     def warmup_model(self):
         torch.cuda.empty_cache()
@@ -120,21 +154,39 @@ class MultimodalModelRunner:
         multimodal_inputs = {
             'image_features': [],
             'image_positions': [],
-            'has_images': []
+            'has_images': [],
+            'pixel_values': None 
         }
 
+        all_pixel_values = []
         for seq in seqs:
             if seq.has_images:
                 processed_images = []
                 for image in seq.images:
-                    # TODO: 缺少 image_processor 处理图像
-                    pass
+                    if self.image_processor is not None:
+                        if isinstance(image, torch.Tensor):
+                            if image.dim() == 3 and image.shape[0] == 3:
+                                image = image.permute(1, 2, 0)
+                            image_pil = Image.fromarray((image.cpu().numpy() * 255).astype('uint8'))
+                        elif isinstance(image, Image.Image):
+                            image_pil = image
+                        else:
+                            image_pil = image
+
+                        # Process the image
+                        processed = self.image_processor(image_pil, return_tensors="pt")
+                        pixel_values = processed["pixel_values"]
+                        all_pixel_values.append(pixel_values)
+                        processed_images.append(pixel_values)
 
                 multimodal_inputs['image_features'].append(processed_images)
                 multimodal_inputs['image_positions'].append(seq.get_image_positions)
                 multimodal_inputs['has_images'].append(True)
             else:
                 multimodal_inputs['has_images'].append(False)
+
+        if all_pixel_values:
+            multimodal_inputs['pixel_values'] = torch.cat(all_pixel_values, dim=0)
 
         return multimodal_inputs
 
@@ -227,14 +279,20 @@ class MultimodalModelRunner:
                 'positions': positions
             }
 
-            if multimodal_inputs is not None:
-                if any(multimodal_inputs['has_images']):
-                    # TODO: 这里还需要加一下合并文本嵌入和图像特征的逻辑
-                    pass
-            outputs = self.model(**model_kwargs)
-            return self.model.compute_logits(outputs)
+            if multimodal_inputs is not None and any(multimodal_inputs['has_images']):
+                if multimodal_inputs['pixel_values'] is not None:
+                    model_kwargs['pixel_values'] = multimodal_inputs['pixel_values']
+            if hasattr(self.model, 'vision_tower'):
+                hidden_states = self.model(**model_kwargs)
+                return self.model.compute_logits(hidden_states)
+            else:
+                # Standard model
+                outputs = self.model(**model_kwargs)
+                if hasattr(outputs, 'logits'):
+                    return outputs.logits
+                else:
+                    return self.model.compute_logits(outputs)
         else:
-            # TODO: 实现多模态的 CUDA graph
             return self._run_with_cudagraph(input_ids, positions)
 
     def run(self, seqs: List[MultimodalSequence], is_prefill: bool) -> List[int]:
