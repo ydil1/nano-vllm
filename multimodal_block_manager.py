@@ -122,7 +122,16 @@ class MultimodalBlockManager:
 
     def allocate(self, seq):
         assert not seq.block_table, f"Sequence {seq.seq_id} already has blocks"
-        if hasattr(seq, 'images') and seq.images:
+        # Check if sequence has images (handle both list and tensor cases)
+        import torch
+        has_images = False
+        if hasattr(seq, 'images'):
+            if isinstance(seq.images, torch.Tensor):
+                has_images = True
+            elif seq.images:
+                has_images = True
+
+        if has_images:
             segments = self.analyze(seq)
             self.multimodal_segments[seq.seq_id] = segments
         h = -1
