@@ -84,16 +84,13 @@ class PipelineManager:
         self.running = True
         self.monitor_thread = None
 
-        if config.get('verbose', False):
-            self._start_monitor()
-
     def _start_monitor(self):
         self.monitor_thread = threading.Thread(target=self._monitor_pipeline, daemon=True)
         self.monitor_thread.start()
 
     def _monitor_pipeline(self):
         while self.running:
-            time.sleep(5.0) 
+            time.sleep(5.0)  # Report every 5 seconds
 
             vision_pending = self.vision_queue.qsize()
             llm_pending = self.llm_queue.qsize()
@@ -101,12 +98,15 @@ class PipelineManager:
 
             print(f"[Pipeline Monitor] Vision Queue: {vision_pending}, "
                   f"LLM Queue: {llm_pending}, Buffer: {buffer_size}")
+
+            # Check for bottlenecks
             if vision_pending > 50:
                 print("[Pipeline Monitor] WARNING: Vision queue backlog detected")
             if llm_pending > 50:
                 print("[Pipeline Monitor] WARNING: LLM queue backlog detected")
 
     def should_send_to_llm(self, request_id: str) -> bool:
+        # Check if vision features are ready
         if request_id not in self.vision_buffer:
             return False
 
@@ -161,6 +161,11 @@ class PipelineManager:
 
 
 class MultimodalLLMEngine:
+    """
+    Main engine for multimodal LLM inference
+    Coordinates between vision encoder, LLM decoder, and manages the pipeline
+    """
+
     def __init__(self, model_path: str,
                  vision_device: str = "cuda:0",
                  language_device: str = "cuda:1",
@@ -229,12 +234,6 @@ class MultimodalLLMEngine:
         self.process_thread = threading.Thread(target=self._process_requests, daemon=True)
         self.process_thread.start()
 
-        if self.verbose:
-            print(f"[MultimodalLLMEngine] Initialized")
-            print(f"[MultimodalLLMEngine] Model: {model_path}")
-            print(f"[MultimodalLLMEngine] Vision Device: {vision_device}")
-            print(f"[MultimodalLLMEngine] Language Device: {language_device}")
-            print(f"[MultimodalLLMEngine] Pipeline Parallel: {enable_pipeline_parallel}")
 
     def _process_requests(self):
         """Process pending requests"""
@@ -246,8 +245,12 @@ class MultimodalLLMEngine:
                         result = self.scheduler.get_result(request_id, timeout=0)
                         if result:
                             request = self.pending_requests.pop(request_id)
+
+                            # Update metrics
                             if self.pipeline_manager:
                                 self.pipeline_manager.update_metrics(request_id, 'completion')
+
+                            # Create response
                             response = MultimodalResponse(
                                 request_id=request_id,
                                 text=result.get('response', ''),
@@ -260,16 +263,10 @@ class MultimodalLLMEngine:
 
                             self.completed_requests[request_id] = response
 
-                            if self.verbose:
-                                print(f"[MultimodalLLMEngine] Completed request {request_id}")
 
                 time.sleep(0.01)
 
             except Exception as e:
-                if self.verbose:
-                    print(f"[MultimodalLLMEngine] Processing error: {e}")
-                    import traceback
-                    traceback.print_exc()
                 time.sleep(0.1)
 
     def add_request(self, prompt: str,
@@ -314,8 +311,6 @@ class MultimodalLLMEngine:
 
         # Check if we can allocate blocks
         if not self.block_manager.can_allocate(sequence):
-            if self.verbose:
-                print(f"[MultimodalLLMEngine] Cannot allocate blocks for request {request_id}")
             return None
 
         # Allocate blocks
@@ -333,11 +328,6 @@ class MultimodalLLMEngine:
             priority=arrival_time
         )
 
-        if self.verbose:
-            print(f"[MultimodalLLMEngine] Added request {request_id}")
-            if images:
-                print(f"  - {len(images)} images")
-            print(f"  - {len(token_ids)} tokens")
 
         return request_id
 
@@ -429,9 +419,6 @@ class MultimodalLLMEngine:
 
     def shutdown(self):
         """Shutdown the engine"""
-        if self.verbose:
-            print("[MultimodalLLMEngine] Shutting down...")
-
         self.running = False
 
         # Wait for processing thread
@@ -446,9 +433,6 @@ class MultimodalLLMEngine:
             self.pipeline_manager.shutdown()
 
         torch.cuda.empty_cache()
-
-        if self.verbose:
-            print("[MultimodalLLMEngine] Shutdown complete")
 
 
 def create_engine(model_path: str,
